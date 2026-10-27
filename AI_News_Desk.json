@@ -1,0 +1,318 @@
+{
+  "name": "AI News Desk",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Manual Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -700,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "news-desk",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook (POST /news-desk)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -700,
+        60
+      ],
+      "webhookId": "news-desk"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every Morning 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -700,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// On-demand request: topic + time window (days). Webhook body or manual defaults.\nconst b = $input.first().json.body || $input.first().json || {};\nconst topic = String(b.topic || 'AI agents in business automation').trim();\nconst days = Math.min(Math.max(parseInt(b.days || 3, 10) || 3, 1), 30);\nconst language = String(b.language || 'English');\nconst q = encodeURIComponent(`${topic} when:${days}d`);\nreturn [{ json: { mode: 'topic', title: `${topic} — last ${days} day(s)`, days, language, maxItems: Math.min(parseInt(b.max || 15, 10) || 15, 40),\n  feeds: [{ section: topic, url: `https://news.google.com/rss/search?q=${q}&hl=en-US&gl=US&ceid=US:en` }] } }];"
+      },
+      "name": "Topic Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Daily newspaper: edit your sections and feeds here.\nconst feeds = [\n  { section: 'Security', url: 'https://feeds.feedburner.com/TheHackersNews' },\n  { section: 'Security', url: 'https://www.bleepingcomputer.com/feed/' },\n  { section: 'AI & Automation', url: 'https://news.google.com/rss/search?q=%22AI+agents%22+OR+n8n+OR+automation+when:1d&hl=en-US&gl=US&ceid=US:en' },\n  { section: 'Tech', url: 'https://hnrss.org/frontpage?points=150' },\n];\nreturn [{ json: { mode: 'daily', title: 'Morning newspaper — ' + $now.setZone('Europe/Warsaw').toFormat('dd.MM.yyyy'), days: 1, language: 'English', maxItems: 30, feeds } }];"
+      },
+      "name": "Newspaper Feeds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fetch every RSS/Atom feed, keep items inside the time window, remove duplicates by title.\nconst req = $input.first().json;\nconst since = Date.now() - req.days * 86400000;\nconst dec = s => String(s || '').replace(/<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>/g, '$1').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&#39;/g, \"'\").replace(/&amp;/g, '&');\nconst tag = (x, t) => { const m = x.match(new RegExp(`<${t}[^>]*>([\\\\s\\\\S]*?)<\\\\/${t}>`, 'i')); return m ? dec(m[1]).trim() : ''; };\nconst items = [], errors = [], seen = new Set();\nfor (const f of req.feeds) {\n  let xml = '';\n  try { xml = await this.helpers.httpRequest({ url: f.url, headers: { 'User-Agent': 'Mozilla/5.0 (n8n News Desk)' }, json: false, timeout: 20000 }); }\n  catch (e) { errors.push(`${f.url.slice(0, 60)}: ${String(e.message || e).slice(0, 80)}`); continue; }\n  const blocks = String(xml).split(/<item[\\s>]|<entry[\\s>]/i).slice(1);\n  for (const b of blocks) {\n    const title = tag(b, 'title').replace(/<[^>]+>/g, '');\n    const link = tag(b, 'link') || (b.match(/<link[^>]+href=\"([^\"]+)\"/i) || [])[1] || '';\n    const date = new Date(tag(b, 'pubDate') || tag(b, 'published') || tag(b, 'updated') || Date.now());\n    const key = title.toLowerCase().replace(/\\s+-\\s+[^-]+$/, '').replace(/[^a-z0-9 ]/g, '').trim();\n    if (!title || seen.has(key) || (!isNaN(date) && date.getTime() < since)) continue;\n    seen.add(key);\n    const desc = (tag(b, 'description') || tag(b, 'summary')).replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 300);\n    items.push({ section: f.section, title, link, source: tag(b, 'source') || (link.match(/https?:\\/\\/([^/]+)/) || [])[1] || '', date: isNaN(date) ? '' : date.toISOString(), desc });\n  }\n}\nitems.sort((a, b) => (b.date || '').localeCompare(a.date || ''));\nconst picked = items.slice(0, req.maxItems);\nconst list = picked.map((it, i) => `[${i + 1}] (${it.section}) ${it.title} — ${it.source} ${it.date.slice(0, 10)}\\n${it.desc}`).join('\\n\\n');\nconst prompt = `You are a news editor. Write a ${req.mode === 'daily' ? 'morning newspaper' : 'news briefing'} in ${req.language} titled \"${req.title}\".\nUse ONLY the items below; do not add facts. Group by section, start with the 3 most important stories, give each story a bold headline and 1-2 sentence summary, and cite sources as [n].\nEnd with \"Why it matters\" (2 bullet points). Keep it under 450 words. Markdown only.\n\n${list || '(no items)'}`;\nreturn [{ json: { ...req, items: picked, errors, count: picked.length,\n  requestBody: { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3 } } } }];"
+      },
+      "name": "Fetch & Filter Feeds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "name": "Gemini Editor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        100
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "",
+          "name": "Gemini API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Attach the numbered source list and split for Discord (<= 1900 chars per message).\nconst req = $('Fetch & Filter Feeds').first().json;\nconst text = $input.first().json.candidates?.[0]?.content?.parts?.[0]?.text || (req.count ? '_The model returned no text._' : '_No news items in this time window._');\nconst sources = req.items.map((it, i) => `[${i + 1}] ${it.title} — <${it.link}>`).join('\\n');\nconst body = text.replace(/^\\s*#{1,2} .*\\n+/, '');   // the model often repeats the title as a heading\nconst markdown = `## ${req.title}\\n\\n${body}\\n\\n**Sources**\\n${sources}` + (req.errors.length ? `\\n\\n_Feeds with errors: ${req.errors.length}_` : '');\nconst lines = markdown.split('\\n').flatMap(l => l.length > 1900 ? l.match(/[\\s\\S]{1,1900}/g) : [l]);  // hard-split very long lines\nconst chunks = []; let cur = '';\nfor (const line of lines) { if ((cur + '\\n' + line).length > 1900) { chunks.push(cur); cur = line; } else cur = cur ? cur + '\\n' + line : line; }\nif (cur) chunks.push(cur);\nreturn chunks.map((content, i) => ({ json: { mode: req.mode, title: req.title, count: req.count, markdown: i === 0 ? markdown : undefined, content } }));"
+      },
+      "name": "Format Briefing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.mode }}",
+              "rightValue": "daily",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Daily?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "message",
+        "guildId": {
+          "__rl": true,
+          "value": "YOUR_DISCORD_SERVER_ID",
+          "mode": "id"
+        },
+        "channelId": {
+          "__rl": true,
+          "value": "YOUR_DISCORD_CHANNEL_ID",
+          "mode": "id"
+        },
+        "options": {},
+        "content": "={{ $json.content }}"
+      },
+      "name": "Discord: Newspaper",
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        680,
+        20
+      ],
+      "credentials": {
+        "discordOAuth2Api": {
+          "id": "",
+          "name": "Discord Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ title: $json.title, count: $json.count, markdown: $('Format Briefing').first().json.markdown }) }}",
+        "options": {}
+      },
+      "name": "Respond with Briefing",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        680,
+        200
+      ],
+      "executeOnce": true
+    }
+  ],
+  "connections": {
+    "Manual Test": {
+      "main": [
+        [
+          {
+            "node": "Topic Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook (POST /news-desk)": {
+      "main": [
+        [
+          {
+            "node": "Topic Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Morning 07:00": {
+      "main": [
+        [
+          {
+            "node": "Newspaper Feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Topic Request": {
+      "main": [
+        [
+          {
+            "node": "Fetch & Filter Feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Newspaper Feeds": {
+      "main": [
+        [
+          {
+            "node": "Fetch & Filter Feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch & Filter Feeds": {
+      "main": [
+        [
+          {
+            "node": "Gemini Editor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Editor": {
+      "main": [
+        [
+          {
+            "node": "Format Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Briefing": {
+      "main": [
+        [
+          {
+            "node": "Daily?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily?": {
+      "main": [
+        [
+          {
+            "node": "Discord: Newspaper",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond with Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
